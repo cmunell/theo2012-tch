@@ -1,12 +1,17 @@
 package edu.cmu.ml.rtw.theo2012.tch;
 
 import java.io.File;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.Collection;
 import java.util.Iterator;
 import java.util.Map;
 import java.util.Set;
 import java.util.NoSuchElementException;
+import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
@@ -45,6 +50,9 @@ import edu.cmu.ml.rtw.util.Timer;
  */
 public class TCHStoreMap implements StringListStoreMap {
     private final static Logger log = LogFactory.getLogger();
+    private final ReentrantReadWriteLock rwl = new ReentrantReadWriteLock(true);
+    private final Lock readLock = rwl.readLock();
+    private final Lock writeLock = rwl.writeLock();
 
     /**
      * Database cache
@@ -55,6 +63,9 @@ public class TCHStoreMap implements StringListStoreMap {
      * overhead when it's not small (say 1k-10k).
      */
     protected class RTWValCache extends StringListStoreMapCache {
+        private final ReentrantReadWriteLock crwl = new ReentrantReadWriteLock(true);
+        private final Lock cReadLock = crwl.readLock();
+        private final Lock cWriteLock = crwl.writeLock();
         protected final boolean writeInXML = false;
 
         public RTWValCache(int cacheSize, boolean writeBack, boolean readOnly,
@@ -65,7 +76,13 @@ public class TCHStoreMap implements StringListStoreMap {
         @Override protected RTWListValue get(String key) {
             try {
                 RTWListValue value = null;
-                byte[] bytes = db.get(key.getBytes());
+                byte[] bytes;
+                cReadLock.lock();
+                try {
+                    bytes = db.get(key.getBytes());
+                } finally {
+                    cReadLock.unlock();
+                }
                 if (bytes != null) {
                     boolean wantToUpdateExistingValue = false;
 
@@ -131,14 +148,18 @@ public class TCHStoreMap implements StringListStoreMap {
                         // Proactively convert any XML value to a UTF8 one on sight (as long as
                         // we're not read-only)
                         if (bytes[0] == '<') wantToUpdateExistingValue = true;
-
+                        
                         if (!readOnly && wantToUpdateExistingValue) {
-                            if (value == null) db.out(key.getBytes());
-                            else db.put(key.getBytes(), value.toUTF8());
+                            cWriteLock.lock();
+                            try {
+                                if (value == null) db.out(key.getBytes());
+                                else db.put(key.getBytes(), value.toUTF8());
+                            } finally {
+                                cWriteLock.unlock();
+                            }
                         }
                     }
                 }
-
                 return value;
             } catch (Exception e) {
                 throw new RuntimeException("get(\"" + key + "\")", e);
@@ -146,6 +167,7 @@ public class TCHStoreMap implements StringListStoreMap {
         }
 
         @Override protected void put(String location, RTWListValue value, boolean mightMutate) {
+            cWriteLock.lock();
             try {
                 Preconditions.checkNotNull(db, "database is not open.");
                 Preconditions.checkState(!readOnly, "Internal error: Should not have had a dirty entry to commit on a read-only KB");
@@ -166,14 +188,21 @@ public class TCHStoreMap implements StringListStoreMap {
             } catch (Exception e) {
                 throw new RuntimeException("put(\"" + location + "\", " + value + ", " + mightMutate
                         + ")", e);
+            } finally {
+                cWriteLock.unlock();
             }
         }
 
         @Override protected void remove(String key) {
-            Preconditions.checkNotNull(db, "database is not open.");
-            Preconditions.checkState(!readOnly, "Internal error: Should not have had a dirty entry to commit on a read-only KB");
-
-            db.out(key.getBytes());
+            cWriteLock.lock();
+            try {
+                Preconditions.checkNotNull(db, "database is not open.");
+                Preconditions.checkState(!readOnly, "Internal error: Should not have had a dirty entry to commit on a read-only KB");
+                
+                db.out(key.getBytes());
+            } finally {
+                cWriteLock.unlock();
+            }
         }
     }
 
@@ -420,6 +449,7 @@ public class TCHStoreMap implements StringListStoreMap {
     ////////////////////////////////////////////////////////////////////////////
 
     @Override public void open(String filename, boolean openInReadOnlyMode) {
+        writeLock.lock();
         try {
             Preconditions.checkNotNull(filename);
             Preconditions.checkState(db == null, "close open DB beore calling setDbFilePath");
@@ -535,61 +565,88 @@ public class TCHStoreMap implements StringListStoreMap {
             }
         } catch (Exception e) {
             throw new RuntimeException("open(\"" + filename + "\", " + openInReadOnlyMode + ")", e);
+        } finally {
+            writeLock.unlock();
         }
     }
 
     @Override public void close() {
-        Preconditions.checkState(db != null, "DB is not open");
-        flush(true);
-        if (!db.close()) {
-            int ecode = db.ecode();
-            log.error("close error: " + HDB.errmsg(ecode));
+        writeLock.lock();
+        try {
+            Preconditions.checkState(db != null, "DB is not open");
+            flush(true);
+            if (!db.close()) {
+                int ecode = db.ecode();
+                log.error("close error: " + HDB.errmsg(ecode));
+            }
+            openDBLocation = null;
+            db = null;
+            if (kbCache != null) kbCache.clear();
+            if (kbCacheTL != null) kbCacheTL.get().clear();
+            activeIterator = null;
+        } finally {
+            writeLock.unlock();
         }
-        openDBLocation = null;
-        db = null;
-        if (kbCache != null) kbCache.clear();
-        if (kbCacheTL != null) kbCacheTL.get().clear();
-        activeIterator = null;
     }
 
     @Override public String getLocation() {
-        if (db == null) return null;
-        return openDBLocation;
+        readLock.lock();
+        try {
+            if (db == null) return null;
+            return openDBLocation;
+        } finally {
+            readLock.unlock();
+        }
     }
 
     @Override public boolean isReadOnly() {
-        Preconditions.checkState(db != null, "Database not open.");
-        return readOnly;
+        readLock.lock();
+        try {
+            Preconditions.checkState(db != null, "Database not open.");
+            return readOnly;
+        } finally {
+            readLock.unlock();
+        }
     }
 
     @Override public void flush(boolean sync) {
-        // TODO: move logging into the flush method and have it auto-log if more than, say, 200ms go by
-        if (!readOnly) log.info("Flushing TCH cache...");
-        if (kbCache != null) kbCache.clear();
-        if (kbCacheTL != null) kbCacheTL.get().clear();
-        if (sync) db.sync();
-        if (!readOnly) log.info("Done flushing.");
+        writeLock.lock();
+        try {
+            // TODO: move logging into the flush method and have it auto-log if more than, say, 200ms go by
+            if (!readOnly) log.info("Flushing TCH cache...");
+            if (kbCache != null) kbCache.clear();
+            if (kbCacheTL != null) kbCacheTL.get().clear();
+            if (sync) db.sync();
+            if (!readOnly) log.info("Done flushing.");
+        } finally {
+            writeLock.unlock();
+        }
     }
 
     @Override public void copy(String filename) {
-        Preconditions.checkState(db != null, "database is not open.");
-        Preconditions.checkNotNull(filename);
+        readLock.lock();
+        try {
+            Preconditions.checkState(db != null, "database is not open.");
+            Preconditions.checkNotNull(filename);
 
-        if (!db.copy(filename)) {
-            // 2012-01: I don't see why this should ever happen, but it did once.  On the off chance
-            // that it wasn't some strange matter of rebuilding classes while the JVM was still
-            // loading them or something like that, I'd like to give another shot to trying to get
-            // some kind of error code out of the situation.
-            //
-            // No exception in this case because a copy to /dev/null has no end-result anyway, and
-            // is used only for the side-effect of pulling the database file into the OS page cache.
-            if (filename.equals("/dev/null")) {
-                log.error("Error copying DB to /dev/null, ecode=" + db.ecode() + ", msg="
-                        + db.errmsg());
-            } else {
-                // db doesn't report an error code in this case
-                throw new RuntimeException("Error copying DB to \"" + filename + "\"");
+            if (!db.copy(filename)) {
+                // 2012-01: I don't see why this should ever happen, but it did once.  On the off chance
+                // that it wasn't some strange matter of rebuilding classes while the JVM was still
+                // loading them or something like that, I'd like to give another shot to trying to get
+                // some kind of error code out of the situation.
+                //
+                // No exception in this case because a copy to /dev/null has no end-result anyway, and
+                // is used only for the side-effect of pulling the database file into the OS page cache.
+                if (filename.equals("/dev/null")) {
+                    log.error("Error copying DB to /dev/null, ecode=" + db.ecode() + ", msg="
+                            + db.errmsg());
+                } else {
+                    // db doesn't report an error code in this case
+                    throw new RuntimeException("Error copying DB to \"" + filename + "\"");
+                }
             }
+        } finally {
+            readLock.unlock();
         }
     }
 
@@ -603,154 +660,173 @@ public class TCHStoreMap implements StringListStoreMap {
      * net speedup.
      */
     @Override public void giveLargeAccessHint() {
-        // No-op if not open
-        if (db == null) return;
+        readLock.lock();
+        try {
+            // No-op if not open
+            if (db == null) return;
 
-        // We could do this only once and then hope that the TCH file isn't kicked out of the cache
-        // ever afterward, but we'll see what happens if we don't.  My thinking is that this
-        // operation should take but a moment if the TCH file is in fact in the cache.
-        //
-        // Presumably, this will be very hard on a system that can't keep the entire TCH file in
-        // RAM.  But how close can such a system be to gasping and choking anyway?  We can change
-        // this policy as needed.
-        //
-        // Some use cases have us doing this more than we'd really want to.  As a crude saftey
-        // mechanism against hints that come too often from over-eager signalling or from
-        // hapenstatnce, I'm going to restrict a pull into the page cache to once every 10 minutes.
-        // My guess is that if doing this repeatedly every 10 minutes is going to make a difference
-        // to performance, then the computer is really getting hammered anyway, and trying to trying
-        // to keep the file in RAM is at best not going to be very helpful.
+            // We could do this only once and then hope that the TCH file isn't kicked out of the cache
+            // ever afterward, but we'll see what happens if we don't.  My thinking is that this
+            // operation should take but a moment if the TCH file is in fact in the cache.
+            //
+            // Presumably, this will be very hard on a system that can't keep the entire TCH file in
+            // RAM.  But how close can such a system be to gasping and choking anyway?  We can change
+            // this policy as needed.
+            //
+            // Some use cases have us doing this more than we'd really want to.  As a crude saftey
+            // mechanism against hints that come too often from over-eager signalling or from
+            // hapenstatnce, I'm going to restrict a pull into the page cache to once every 10 minutes.
+            // My guess is that if doing this repeatedly every 10 minutes is going to make a difference
+            // to performance, then the computer is really getting hammered anyway, and trying to trying
+            // to keep the file in RAM is at best not going to be very helpful.
 
-        long now = System.currentTimeMillis();
-        if (now - lastLargeAccessHint < 10*60*1000) {
-            log.debug("Ignoring large access hint because we re-read " + getLocation()
-                    + " less than 10 minutes ago.");
-        } else {
-            log.debug("Pulling " + getLocation() + " into OS page cache...");
-            copy("/dev/null");
-            lastLargeAccessHint = System.currentTimeMillis();
+            long now = System.currentTimeMillis();
+            if (now - lastLargeAccessHint < 10*60*1000) {
+                log.debug("Ignoring large access hint because we re-read " + getLocation()
+                        + " less than 10 minutes ago.");
+            } else {
+                log.debug("Pulling " + getLocation() + " into OS page cache...");
+                copy("/dev/null");
+                lastLargeAccessHint = System.currentTimeMillis();
+            }
+        } finally {
+            readLock.unlock();
         }
     }
 
     @Override public void logStats() {
-        if (kbCache != null) kbCache.logStats();
-        if (kbCacheTL != null) kbCacheTL.get().logStats();
+        readLock.lock();
+        try {
+            if (kbCache != null) kbCache.logStats();
+            if (kbCacheTL != null) kbCacheTL.get().logStats();
+        } finally {
+            readLock.unlock();
+        }
     }
 
     @Override public void optimize() {
-        if (readOnly)
-            throw new RuntimeException("Cannot optimize when in read-only mode");
-        log.info("Optimizing DB...");
-        Timer t = new Timer();
-        t.start();
+        writeLock.lock();
+        try {
+            if (readOnly)
+                throw new RuntimeException("Cannot optimize when in read-only mode");
+            log.info("Optimizing DB...");
+            Timer t = new Timer();
+            t.start();
 
-        // Tokyo Cabinet's optimize routine works by creating a new, optimized copy of the DB file
-        // alongside the existing DB file, then deletes the existing DB file and renames the
-        // temporary copy.  So you could get as much as a doubling of space requirements along the
-        // way, and that can be a problem when the DB file is sitting in a RAM drive or some other
-        // small, special-purpose thing like that.  So we have an optional optimizeKbFilePath
-        // parameter that specifies a secondary location to use for this process.
-        //
-        // Then the problem becomes getting Tokyo Cabinet to use this secondary location.  It turns
-        // out that one can play some tricks with symlinks to do this, but that turs out to be
-        // failure-prone, particularly when it comes to relative paths.
-        //
-        // Fortunately, it turns out that running something like "tchmgr list -pv src.tch | tchmgr
-        // importtsv dst.tch" creates a dst.tch that is an optimized vesion of src.tch, and you have
-        // full control over the two DB file locations.  Simply running that commandline is
-        // failure-prone in that it will get tripped up by keys that contain tab characters or
-        // newlines in the record values.  So we do the equivalent of that operation manually here,
-        // and quite possibly save on time that would be spent rendering and parsing the TSV.
-        //
-        // As it happens, the implementation below does not seem to be as fast as using tchmgr.
-        // Maybe because it's not split into two threads?  It's certainly not I/O-bound.  Anyway,
-        // it's not too terribly bad, and we can opt to reinvestigate later on if we specifically
-        // want to spend time making NELL faster.
-        //
-        // And there is one more subtlety here.  The difficulty that Tokyo Cabinet hash DBs present
-        // to a storage mechanism is of scattered small writes with horrid locality -- something
-        // that is an efficienty problem even for RAM (relatively speaking).  It's pathologically
-        // bad for common cases like a RAID5 or RAID6 array to the point of being able to cripple
-        // the array and keep it that way for hours.  Now, if optimizeKbFilePath has been specified,
-        // then our underlying assumption is that it specifies a location that is somehow less
-        // desirable than workingKbFilePath.  So, if we had to choose one to be subjected to these
-        // scattered writes, then it would be workingKbFilePath.  Therefore, we first copy the DB
-        // file to optimizeKbFilePath, and then read that copy and write the new optimized copy to
-        // workingKbFilePath.  That way, optimizeKbFilePath is subjected to the relatively easy and
-        // efficient case of a big, sequential write -- something not at all pathological for a
-        // RADI5 or RAID6 array -- and then only has to cope with a big, sequential read, and now
-        // there's even a chance that we'll be reading from the OS's cache instead of hitting the
-        // underlying storage device.  In practice, the benefit from doing things this way can be
-        // collossal.
-
-        String workingKbFilePath = getLocation();
-        String optimizeKbFilePath = properties.getProperty("optimizeKbFilePath", null);
-        if (optimizeKbFilePath == null) {
-            // Oh, well.  All we can do is let the chips fall where they may.
-            if (!db.optimize())
-                throw new RuntimeException("Optimization failed!  KB corrupt now?");
-        } else {
-            close();
-            (new File(workingKbFilePath)).delete();
-            (new File(optimizeKbFilePath)).delete();
-            
-            HDB src = new HDB();
-            HDB dst = new HDB();
-
-            // Here, we must make sure to put eough buckets in dst or else the bucket setting
-            // originally set by our open method will be lost.  While 100B buckets was "way more
-            // than enough" when we first started using Tokyo Cabinet, we find circa iteration 500
-            // that we wind up with somewhat more than 200B records.  The Tokyo Cabinet
-            // documentation suggests using .5x to 4x as many buckets as records.  It's not clear
-            // that moving up to 100B from the ~130k default produced the kind of speedups we were
-            // expecting, so let's shoot for 500B buckets given 200B records.
+            // Tokyo Cabinet's optimize routine works by creating a new, optimized copy of the DB file
+            // alongside the existing DB file, then deletes the existing DB file and renames the
+            // temporary copy.  So you could get as much as a doubling of space requirements along the
+            // way, and that can be a problem when the DB file is sitting in a RAM drive or some other
+            // small, special-purpose thing like that.  So we have an optional optimizeKbFilePath
+            // parameter that specifies a secondary location to use for this process.
             //
-            // Now, here's the part where we cheat and know that, at present (2012-03), NELL
-            // optimizes its DB on each iteration after blowing away all concepts, meaning that we
-            // need to over-project the number of buckets to use here if we're basing it off of the
-            // number of records.  It turns out that the ~200B-record database was about 50B at time
-            // of optimization, so we'll set the bucket size to be 10x the number of records.  We
-            // can always come back and make this something more tame if this results in
-            // objectionably-large DBs for small KBs.  It doesn't seem to lead to much of any
-            // speedup, anyway, which perhaps is worth further investigation.
+            // Then the problem becomes getting Tokyo Cabinet to use this secondary location.  It turns
+            // out that one can play some tricks with symlinks to do this, but that turs out to be
+            // failure-prone, particularly when it comes to relative paths.
+            //
+            // Fortunately, it turns out that running something like "tchmgr list -pv src.tch | tchmgr
+            // importtsv dst.tch" creates a dst.tch that is an optimized vesion of src.tch, and you have
+            // full control over the two DB file locations.  Simply running that commandline is
+            // failure-prone in that it will get tripped up by keys that contain tab characters or
+            // newlines in the record values.  So we do the equivalent of that operation manually here,
+            // and quite possibly save on time that would be spent rendering and parsing the TSV.
+            //
+            // As it happens, the implementation below does not seem to be as fast as using tchmgr.
+            // Maybe because it's not split into two threads?  It's certainly not I/O-bound.  Anyway,
+            // it's not too terribly bad, and we can opt to reinvestigate later on if we specifically
+            // want to spend time making NELL faster.
+            //
+            // And there is one more subtlety here.  The difficulty that Tokyo Cabinet hash DBs present
+            // to a storage mechanism is of scattered small writes with horrid locality -- something
+            // that is an efficienty problem even for RAM (relatively speaking).  It's pathologically
+            // bad for common cases like a RAID5 or RAID6 array to the point of being able to cripple
+            // the array and keep it that way for hours.  Now, if optimizeKbFilePath has been specified,
+            // then our underlying assumption is that it specifies a location that is somehow less
+            // desirable than workingKbFilePath.  So, if we had to choose one to be subjected to these
+            // scattered writes, then it would be workingKbFilePath.  Therefore, we first copy the DB
+            // file to optimizeKbFilePath, and then read that copy and write the new optimized copy to
+            // workingKbFilePath.  That way, optimizeKbFilePath is subjected to the relatively easy and
+            // efficient case of a big, sequential write -- something not at all pathological for a
+            // RADI5 or RAID6 array -- and then only has to cope with a big, sequential read, and now
+            // there's even a chance that we'll be reading from the OS's cache instead of hitting the
+            // underlying storage device.  In practice, the benefit from doing things this way can be
+            // collossal.
 
-            // bkisiel 2012-09-07: We've hit some very strange case where Tokyo Cabinet gets hung up
-            // (largely in system time) on a get operation for a certain key and never returns.
-            // This happens while executing CRC's or CRU's TCF.  It turns out that setting
-            // HDB.TLARGE fixes this, which seems consistent with earlier findings suggesting that
-            // moving from a record alignment of 16 to 32 worked similarly.
+            String workingKbFilePath = getLocation();
+            String optimizeKbFilePath = properties.getProperty("optimizeKbFilePath", null);
+            if (optimizeKbFilePath == null) {
+                // Oh, well.  All we can do is let the chips fall where they may.
+                if (!db.optimize())
+                    throw new RuntimeException("Optimization failed!  KB corrupt now?");
+            } else {
+                close();
+                Path workingPath = Paths.get(workingKbFilePath);
+                Path optimizePath = Paths.get(optimizeKbFilePath);
+                Files.deleteIfExists(optimizePath);
+                Files.move(workingPath, optimizePath);
 
-            if (!src.open(optimizeKbFilePath, HDB.OREADER))
-                throw new RuntimeException("Error opening " + optimizeKbFilePath + " for reading: "
-                        + src.errmsg());
-            long numBuckets = src.rnum() * 10L;
-            dst.tune(numBuckets, -1, -1, HDB.TLARGE);
-            if (!dst.open(workingKbFilePath, HDB.OWRITER | HDB.OCREAT))
-                throw new RuntimeException("Error opening " + workingKbFilePath + " for writing: "
-                        + dst.errmsg());
-            if (!src.iterinit())
-                throw new RuntimeException("Error from iterinit on " + optimizeKbFilePath + ": "
-                        + src.errmsg());
+                HDB src = new HDB();
+                HDB dst = new HDB();
 
-            // Before we begin, give src the "large access hint".  For whatever reason, in practise,
-            // the mv command alone doesn't always leave the KB sitting in the page cache, and that,
-            // of course, makes a very big difference the speed of this operation.
-            src.copy("/dev/null");
+                // Here, we must make sure to put eough buckets in dst or else the bucket setting
+                // originally set by our open method will be lost.  While 100B buckets was "way more
+                // than enough" when we first started using Tokyo Cabinet, we find circa iteration 500
+                // that we wind up with somewhat more than 200B records.  The Tokyo Cabinet
+                // documentation suggests using .5x to 4x as many buckets as records.  It's not clear
+                // that moving up to 100B from the ~130k default produced the kind of speedups we were
+                // expecting, so let's shoot for 500B buckets given 200B records.
+                //
+                // Now, here's the part where we cheat and know that, at present (2012-03), NELL
+                // optimizes its DB on each iteration after blowing away all concepts, meaning that we
+                // need to over-project the number of buckets to use here if we're basing it off of the
+                // number of records.  It turns out that the ~200B-record database was about 50B at time
+                // of optimization, so we'll set the bucket size to be 10x the number of records.  We
+                // can always come back and make this something more tame if this results in
+                // objectionably-large DBs for small KBs.  It doesn't seem to lead to much of any
+                // speedup, anyway, which perhaps is worth further investigation.
 
-            while (true) {
-                byte[] key = src.iternext();
-                if (key == null) break;
-                dst.put(key, src.get(key));
+                // bkisiel 2012-09-07: We've hit some very strange case where Tokyo Cabinet gets hung up
+                // (largely in system time) on a get operation for a certain key and never returns.
+                // This happens while executing CRC's or CRU's TCF.  It turns out that setting
+                // HDB.TLARGE fixes this, which seems consistent with earlier findings suggesting that
+                // moving from a record alignment of 16 to 32 worked similarly.
+
+                if (!src.open(optimizeKbFilePath, HDB.OREADER))
+                    throw new RuntimeException("Error opening " + optimizeKbFilePath + " for reading: "
+                            + src.errmsg());
+                long numBuckets = src.rnum() * 10L;
+                dst.tune(numBuckets, -1, -1, HDB.TLARGE);
+                if (!dst.open(workingKbFilePath, HDB.OWRITER | HDB.OCREAT))
+                    throw new RuntimeException("Error opening " + workingKbFilePath + " for writing: "
+                            + dst.errmsg());
+                if (!src.iterinit())
+                    throw new RuntimeException("Error from iterinit on " + optimizeKbFilePath + ": "
+                            + src.errmsg());
+
+                // Before we begin, give src the "large access hint".  For whatever reason, in practise,
+                // the mv command alone doesn't always leave the KB sitting in the page cache, and that,
+                // of course, makes a very big difference the speed of this operation.
+                src.copy("/dev/null");
+
+                while (true) {
+                    byte[] key = src.iternext();
+                    if (key == null) break;
+                    dst.put(key, src.get(key));
+                }
+                dst.close();
+                src.close();
+
+                Files.delete(optimizePath);
+
+                open(workingKbFilePath, false);
             }
-            dst.close();
-            src.close();
 
-            (new File(optimizeKbFilePath)).delete();
-
-            open(workingKbFilePath, false);
+            log.info("Optimization took " + t.getElapsedTimeFracHr());
+        } catch (Exception e) {
+            throw new RuntimeException("optimize()", e);
+        } finally {
+            writeLock.unlock();
         }
-
-        log.info("Optimization took " + t.getElapsedTimeFracHr());
     }
 
     public int getCacheSize() {
@@ -758,9 +834,14 @@ public class TCHStoreMap implements StringListStoreMap {
     }
 
     public void setCacheSize(int size) {
-        kbCacheSize = size;
-        if (kbCache != null) kbCache.resize(size);
-        if (kbCacheTL != null) kbCacheTL.get().resize(size);
+        writeLock.lock();
+        try {
+            kbCacheSize = size;
+            if (kbCache != null) kbCache.resize(size);
+            if (kbCacheTL != null) kbCacheTL.get().resize(size);
+        } finally {
+            writeLock.unlock();
+        }
     }
 
     /**
@@ -777,9 +858,14 @@ public class TCHStoreMap implements StringListStoreMap {
      * changes in that case might be lost.
      */
     public void setForceAlwaysDirty(boolean forceAlwaysDirty) {
-        this.forceAlwaysDirty = forceAlwaysDirty;
-        if (kbCache != null) kbCache.setForceAlwaysDirty(forceAlwaysDirty);
-        if (kbCacheTL != null) kbCacheTL.get().setForceAlwaysDirty(forceAlwaysDirty);
+        writeLock.lock();
+        try {
+            this.forceAlwaysDirty = forceAlwaysDirty;
+            if (kbCache != null) kbCache.setForceAlwaysDirty(forceAlwaysDirty);
+            if (kbCacheTL != null) kbCacheTL.get().setForceAlwaysDirty(forceAlwaysDirty);
+        } finally {
+            writeLock.unlock();
+        }
     }
 
     ////////////////////////////////////////////////////////////////////////////
@@ -817,25 +903,30 @@ public class TCHStoreMap implements StringListStoreMap {
     // equality.
 
     @Override public RTWListValue get(Object key) {
-        Preconditions.checkState(db != null, "database is not open.");
-        if (!(key instanceof String)) return null;
-        String keyString = (String)key;
+        readLock.lock();
+        try {
+            Preconditions.checkState(db != null, "database is not open.");
+            if (!(key instanceof String)) return null;
+            String keyString = (String)key;
 
-        RTWValue value;
-        if (kbCache != null) value = kbCache.getValue(keyString);
-        else value = kbCacheTL.get().getValue(keyString);
-        if (value == null) return null;
+            RTWValue value;
+            if (kbCache != null) value = kbCache.getValue(keyString);
+            else value = kbCacheTL.get().getValue(keyString);
+            if (value == null) return null;
 
-        // This provides backward compatability to old KBs.  Autoconvert to a list.  No need to
-        // mess with subslots on the value or anything.
-        if (!(value instanceof RTWListValue)) { 
-            value = new RTWArrayListValue(value); 
-            if (!readOnly) {
-                if (kbCache != null) kbCache.putValue(keyString, (RTWListValue)value); 
-                else kbCacheTL.get().putValue(keyString, (RTWListValue)value);
-            }
-        } 
-        return (RTWListValue)value;
+            // This provides backward compatability to old KBs.  Autoconvert to a list.  No need to
+            // mess with subslots on the value or anything.
+            if (!(value instanceof RTWListValue)) { 
+                value = new RTWArrayListValue(value); 
+                if (!readOnly) {
+                    if (kbCache != null) kbCache.putValue(keyString, (RTWListValue)value); 
+                    else kbCacheTL.get().putValue(keyString, (RTWListValue)value);
+                }
+            } 
+            return (RTWListValue)value;
+        } finally {
+            readLock.unlock();
+        }
     }
 
     @Override public boolean isEmpty() {
@@ -848,46 +939,66 @@ public class TCHStoreMap implements StringListStoreMap {
     }
 
     @Override public RTWListValue put(String key, RTWListValue value) {
-        Preconditions.checkState(db != null, "database is not open.");
-        Preconditions.checkState(!isReadOnly(), "database is open read-only");
-        RTWValue prev;
-        if (kbCache != null) prev = kbCache.putValue(key, value);
-        else throw new RuntimeException("Internal error: shouldn't have threadlocals in read-write mode");
-        if (!(prev instanceof RTWListValue))
-            return new RTWArrayListValue(prev); 
-        return (RTWListValue)prev;
+        writeLock.lock();
+        try {
+            Preconditions.checkState(db != null, "database is not open.");
+            Preconditions.checkState(!isReadOnly(), "database is open read-only");
+            RTWValue prev;
+            if (kbCache != null) prev = kbCache.putValue(key, value);
+            else throw new RuntimeException("Internal error: shouldn't have threadlocals in read-write mode");
+            if (!(prev instanceof RTWListValue))
+                return new RTWArrayListValue(prev); 
+            return (RTWListValue)prev;
+        } finally {
+            writeLock.unlock();
+        }
     }
 
     @Override public void putAll(Map<? extends String,? extends RTWListValue> m) {
-        for (String key : m.keySet())
-            put(key, m.get(key));
+        writeLock.lock();
+        try {
+            for (String key : m.keySet())
+                put(key, m.get(key));
+        } finally {
+            writeLock.unlock();
+        }
     }
 
     @Override public RTWListValue remove(Object key) {
-        Preconditions.checkState(db != null, "database is not open.");
-        Preconditions.checkState(!isReadOnly(), "database is open read-only");
-        if (!(key instanceof String)) return null;
-        String keyString = (String)key;
-        RTWValue prev;
-        if (kbCache != null) prev = kbCache.removeValue(keyString);
-        else prev = kbCacheTL.get().removeValue(keyString);
-        if (!(prev instanceof RTWListValue))
-            return new RTWArrayListValue(prev); 
-        return (RTWListValue)prev;
+        writeLock.lock();
+        try {
+            Preconditions.checkState(db != null, "database is not open.");
+            Preconditions.checkState(!isReadOnly(), "database is open read-only");
+            if (!(key instanceof String)) return null;
+            String keyString = (String)key;
+            RTWValue prev;
+            if (kbCache != null) prev = kbCache.removeValue(keyString);
+            else prev = kbCacheTL.get().removeValue(keyString);
+            if (!(prev instanceof RTWListValue))
+                return new RTWArrayListValue(prev); 
+            return (RTWListValue)prev;
+        } finally {
+            writeLock.unlock();
+        }
     }
 
     @Override public int size() {
-        Preconditions.checkState(db != null, "database is not open.");
+        readLock.lock();
+        try {
+            Preconditions.checkState(db != null, "database is not open.");
         
-        // This isn't very efficient.  If it becomes important, we can have kbCache keep track of
-        // some delta to apply to the size reported by Tokyo Cabinet.
-        if (kbCache != null) kbCache.commitAllDirty(true);
-        else kbCacheTL.get().commitAllDirty(true);
-        long l = db.rnum();
-        if (l > Integer.MAX_VALUE)
-            throw new RuntimeException("There are " + l
-                    + " records, but Integer.MAX_VALUE is only " + Integer.MAX_VALUE);
-        return (int)l;
+            // This isn't very efficient.  If it becomes important, we can have kbCache keep track of
+            // some delta to apply to the size reported by Tokyo Cabinet.
+            if (kbCache != null) kbCache.commitAllDirty(true);
+            else kbCacheTL.get().commitAllDirty(true);
+            long l = db.rnum();
+            if (l > Integer.MAX_VALUE)
+                throw new RuntimeException("There are " + l
+                        + " records, but Integer.MAX_VALUE is only " + Integer.MAX_VALUE);
+            return (int)l;
+        } finally {
+            readLock.unlock();
+        }
     }
 
     @Override public Collection<RTWListValue> values() {
@@ -901,6 +1012,22 @@ public class TCHStoreMap implements StringListStoreMap {
     public static void main(String[] args) {
         TCHStoreMap storeMap = new TCHStoreMap();
         storeMap.open(args[0], true);
+
+        // bkdb TODO: might as well make this a tool in tch temporarily
+        MapDBStoreMap dstMap = new MapDBStoreMap();
+        dstMap.open(args[1], false);
+        for (String key : storeMap.keySet()) {
+            dstMap.put(key, storeMap.get(key));
+        }
+        dstMap.close();
+        storeMap.close();
+        if (true) return;
+
+        // bkdb: testing missing abstractthign memberofsets
+        RTWListValue lv = storeMap.get("abstractthing memberofsets");
+        System.out.println(lv.toString());
+        if (true) return;
+
         for (String key : storeMap.keySet()) {
             System.out.println(key);
         }
