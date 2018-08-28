@@ -438,6 +438,19 @@ public class TCHStoreMap implements StringListStoreMap {
          * too much CPU overhead on smaller KBs; it does not on this one I suppose we could try to
          * set this based on the KB size; for the record, this testing is being done on a KB with
          * 205B records (and with perhaps far too few buckets at 131M!)
+         *
+         * 2018-05: At NELL iteration 1106, shortly after moving to Theo2012, we wound up with
+         * effectively intractably slow operation from the ConceptDeleter component for reasons that
+         * are still not entirely clear but that are somehow related to garbage collection from
+         * having to reload very large slots back in to the KB cache after a large number of
+         * scattered reads/writes causing them to be dropped.  At this time, we explored cache size
+         * settings to see what difference it might make.  It turns out that the traditional default
+         * of 100k is reasonable; going much smaller quickly increases execution time, roughtly
+         * doubling it by 10k.  There is maybe 10% more speed to be had at 1M, although memory use
+         * from the cache is expectably some multiple larger, making it an appropriate tradeoff only
+         * when there is RAM to spare.  Going larger didn't yield speed gains, and it looked like
+         * there might even be speed decrease beyond 10M, probably owing to reduced RAM locality and
+         * more memory management overhead.
          */
         kbCacheSize = properties.getPropertyIntegerValue("kbCacheSize", 100000);
 
